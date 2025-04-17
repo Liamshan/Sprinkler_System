@@ -7,41 +7,60 @@
 #define RELAY_ZONE2 26  // IN2 on relay module
 RTC_DS3231 rtc;
 
+// SRAM address to store 4-byte last watering timestamp
+#define SRAM_ADDR 0x08
+
 // Global Variables
-bool hasWateredToday = false;
+
+Ticker zone1Timer;
+Ticker zone2Timer;
 Ticker stopWateringTimer;
+
+bool hasWateredToday = false;
 bool isWatering = false;
 
-//Function Definitions
+//Function Prototypes
+void stop_zone1();
+void start_zone2();
+void stop_zone2();
 void startup_sequence();
 void error_handling();
 void water_function(const int hour, const int minute);
+void writeLastWateringTime(uint32_t epoch);
+uint32_t readLastWateringTime();
+
 
 void setup() {
-  //Start Serial Bus & I2C
-  Serial.begin(115200);
-  Wire.begin();  // SDA = GPIO21, SCL = GPIO22 (defaults)
-
-  error_handling();
-
-  //Set Pin modes
+  //Set Pin modes and initial state
   pinMode(RELAY_ZONE1, OUTPUT);
   pinMode(RELAY_ZONE2, OUTPUT);
+  digitalWrite(RELAY_ZONE1, HIGH);
+  digitalWrite(RELAY_ZONE2, HIGH);
+
+  //Start Serial Bus & I2C
+  Serial.begin(115200);
+  while (!Serial)
+    ;   //wait for serial monitor to connect
+  delay(1000); //short pause to stabilize
+  
+  Wire.begin();  // SDA = GPIO21, SCL = GPIO22 (defaults)
+  error_handling();
 
   //Run Startup Sequence
   startup_sequence();
+
+  //To force reset watering time to zero days since
+  //writeLastWateringTime(0);
 }
 
 void loop() {
-
-  // Water at 6:30 AM
   water_function(6,30);  //Pass in the time e.g. (6,30) for 6:30am
-
   delay(1000 * 10); // Check every 10 seconds
 }
 
 
 //---Functions---///
+//---Startup---///
 void startup_sequence() {
     // Turn both relays off initially (LOW = off)
   digitalWrite(RELAY_ZONE1, HIGH);
@@ -52,17 +71,17 @@ void startup_sequence() {
   // Turn on zone 1
   Serial.println("Zone 1 ON");
   digitalWrite(RELAY_ZONE1, LOW);
-  delay(30000);  // 30 seconds
+  delay(3000);  // 3 seconds
 
   // Turn off zone 1
   Serial.println("Zone 1 OFF");
   digitalWrite(RELAY_ZONE1, HIGH);
-  delay(10000);  // 10 seconds
+  delay(3000);  // 1 seconds
 
   // Turn on zone 2
   Serial.println("Zone 2 ON");
   digitalWrite(RELAY_ZONE2, LOW);
-  delay(30000);  // 30 seconds
+  delay(3000);  // 3 seconds
 
   // Turn off zone 2
   Serial.println("Zone 2 OFF");
@@ -84,45 +103,98 @@ void error_handling() {
   }
 }
 
+//---Core Logic---///
 void water_function(const int hour, const int minute) {
   DateTime now = rtc.now();
+  uint32_t currentEpoch = now.unixtime();
+  //To print seconds till next watering
+  uint32_t lastWatered = readLastWateringTime();
+  uint32_t nextWateringEpoch = lastWatered + 345600;
 
   // Show current time in Serial Monitor
-  Serial.printf("Time: %02d:%02d:%02d | Day: %d\n", now.hour(), now.minute(), now.second(), now.day());
+  Serial.printf("Time: %02d:%02d:%02d | Day: %d | Seconds till next watering: %lu\n", now.hour(), now.minute(), now.second(), now.day(), nextWateringEpoch - now.unixtime());
 
-  //Water at 6:30 AM
-  if (now.hour() == hour && now.minute() == minute && !hasWateredToday) {   //parameterize this as function inputs passed
-    Serial.println("Watering time!");
 
-    if (!isWatering) {
-      isWatering = true;
-      hasWateredToday = true;
+  // Only check if current time is within watering window (e.g., 6:30 AM)
+  if (now.hour() == hour && now.minute() == minute && !isWatering) {
 
-      if (now.day() % 2 == 0) {
-        Serial.println("Even day -> Zone 1 ON");
-        digitalWrite(RELAY_ZONE1, LOW);
-      } else {
-        Serial.println("Odd day -> Zone 2 ON");
-        digitalWrite(RELAY_ZONE2, LOW);
-      }
+    // Step 1: Get last watering time from RTC SRAM
+    uint32_t lastWateringEpoch = readLastWateringTime();
 
-      // Start non-blocking 20 minute timer
-      stopWateringTimer.once(20 * 60, stop_watering); // 20 minutes
+    // Step 1.5: First boot? if no valid timestamp, set it and skip watering
+    if (lastWateringEpoch == 0xFFFFFFFF || lastWateringEpoch == 0) {
+      Serial.println("First boot detected - skipping watering this time.");
+      writeLastWateringTime(currentEpoch);
+      return;
     }
-    
-  }
 
-  // Reset daily flag after 7:00 AM
-  if (now.hour() == 7 && hasWateredToday) {
-    hasWateredToday = false;
-    Serial.println("Resetting daily flag");
+    // Step 2: Compute time since last watering
+    uint32_t secondsSinceLast = currentEpoch - lastWateringEpoch;
+    Serial.printf("Seconds since last watering: %lu\n", secondsSinceLast);
+
+    //Step 3: Water if 4 or more days have passed
+    if (secondsSinceLast >= 345600) { // 4 days = 345600 seconds
+      Serial.println("It's been 4 days - starting watering sequence!");
+
+      // Update last watering time
+      writeLastWateringTime(currentEpoch);
+
+      // Begin watering Zone 1 - same logic you already had
+      digitalWrite(RELAY_ZONE1, LOW);  // Turn on Zone 1
+      isWatering = true;
+
+      zone1Timer.once(10 * 60, stop_zone1);  //Stop zone 1 in 15 minutes
+    }
   }
 }
 
-void stop_watering() {
-  Serial.println("Watering conplete - turning off zones");
+void stop_zone1() {
+  Serial.println("Stopping Zone 1, pausing before Zone 2...");
   digitalWrite(RELAY_ZONE1, HIGH);
+  zone2Timer.once(5, start_zone2);  //5 second delay
+}
+
+void start_zone2() {
+  Serial.println("Starting Zone 2");
+  digitalWrite(RELAY_ZONE2, LOW);
+  stopWateringTimer.once(10 * 60, stop_zone2); // Stop zone 2 in 15 minutes
+}
+
+void stop_zone2() {
+  Serial.println("Watering complete. Shutting off Zone 2.");
   digitalWrite(RELAY_ZONE2, HIGH);
   isWatering = false;
+}
+
+
+//---RTC SRAM Utilities---//
+
+void writeLastWateringTime(uint32_t epoch) {
+  Wire.beginTransmission(0x57); // DS3231 I2C address
+  Wire.write(SRAM_ADDR);             // Starting SRAM address
+
+  // Write 4 bytes (big endian)
+  Wire.write((epoch >> 24) & 0xFF);
+  Wire.write((epoch >> 16) & 0xFF);
+  Wire.write((epoch >> 8) & 0xFF);
+  Wire.write(epoch & 0xFF);
+  Wire.endTransmission();
+}
+
+uint32_t readLastWateringTime() {
+  Wire.beginTransmission(0x57);
+  Wire.write(0x08); // Starting address
+  Wire.endTransmission();
+
+  Wire.requestFrom(0x57, 4);
+  uint32_t epoch = 0;
+  if (Wire.available() == 4) {
+    epoch |= (Wire.read() << 24);
+    epoch |= (Wire.read() << 16);
+    epoch |= (Wire.read() << 8);
+    epoch |= Wire.read();
+  }
+
+  return epoch;
 }
 
