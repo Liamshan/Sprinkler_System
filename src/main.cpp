@@ -31,18 +31,26 @@ uint32_t readLastWateringTime();
 
 
 void setup() {
-  //Start Serial Bus & I2C
-  Serial.begin(115200);
-  Wire.begin();  // SDA = GPIO21, SCL = GPIO22 (defaults)
-
-  error_handling();
-
-  //Set Pin modes
+  //Set Pin modes and initial state
   pinMode(RELAY_ZONE1, OUTPUT);
   pinMode(RELAY_ZONE2, OUTPUT);
+  digitalWrite(RELAY_ZONE1, HIGH);
+  digitalWrite(RELAY_ZONE2, HIGH);
+
+  //Start Serial Bus & I2C
+  Serial.begin(115200);
+  while (!Serial)
+    ;   //wait for serial monitor to connect
+  delay(1000); //short pause to stabilize
+  
+  Wire.begin();  // SDA = GPIO21, SCL = GPIO22 (defaults)
+  error_handling();
 
   //Run Startup Sequence
   startup_sequence();
+
+  //To force reset watering time to zero days since
+  //writeLastWateringTime(0);
 }
 
 void loop() {
@@ -63,17 +71,17 @@ void startup_sequence() {
   // Turn on zone 1
   Serial.println("Zone 1 ON");
   digitalWrite(RELAY_ZONE1, LOW);
-  delay(30000);  // 30 seconds
+  delay(3000);  // 3 seconds
 
   // Turn off zone 1
   Serial.println("Zone 1 OFF");
   digitalWrite(RELAY_ZONE1, HIGH);
-  delay(10000);  // 10 seconds
+  delay(3000);  // 1 seconds
 
   // Turn on zone 2
   Serial.println("Zone 2 ON");
   digitalWrite(RELAY_ZONE2, LOW);
-  delay(30000);  // 30 seconds
+  delay(3000);  // 3 seconds
 
   // Turn off zone 2
   Serial.println("Zone 2 OFF");
@@ -98,9 +106,13 @@ void error_handling() {
 //---Core Logic---///
 void water_function(const int hour, const int minute) {
   DateTime now = rtc.now();
+  uint32_t currentEpoch = now.unixtime();
+  //To print seconds till next watering
+  uint32_t lastWatered = readLastWateringTime();
+  uint32_t nextWateringEpoch = lastWatered + 345600;
 
   // Show current time in Serial Monitor
-  Serial.printf("Time: %02d:%02d:%02d | Day: %d | Epoch: %lu\n", now.hour(), now.minute(), now.second(), now.day(), now.unixtime());
+  Serial.printf("Time: %02d:%02d:%02d | Day: %d | Seconds till next watering: %lu\n", now.hour(), now.minute(), now.second(), now.day(), nextWateringEpoch - now.unixtime());
 
 
   // Only check if current time is within watering window (e.g., 6:30 AM)
@@ -109,8 +121,14 @@ void water_function(const int hour, const int minute) {
     // Step 1: Get last watering time from RTC SRAM
     uint32_t lastWateringEpoch = readLastWateringTime();
 
+    // Step 1.5: First boot? if no valid timestamp, set it and skip watering
+    if (lastWateringEpoch == 0xFFFFFFFF || lastWateringEpoch == 0) {
+      Serial.println("First boot detected - skipping watering this time.");
+      writeLastWateringTime(currentEpoch);
+      return;
+    }
+
     // Step 2: Compute time since last watering
-    uint32_t currentEpoch = now.unixtime();
     uint32_t secondsSinceLast = currentEpoch - lastWateringEpoch;
     Serial.printf("Seconds since last watering: %lu\n", secondsSinceLast);
 
@@ -125,7 +143,7 @@ void water_function(const int hour, const int minute) {
       digitalWrite(RELAY_ZONE1, LOW);  // Turn on Zone 1
       isWatering = true;
 
-      zone1Timer.once(15 * 60, stop_zone1);  //Stop zone 1 in 15 minutes
+      zone1Timer.once(10 * 60, stop_zone1);  //Stop zone 1 in 15 minutes
     }
   }
 }
@@ -139,7 +157,7 @@ void stop_zone1() {
 void start_zone2() {
   Serial.println("Starting Zone 2");
   digitalWrite(RELAY_ZONE2, LOW);
-  stopWateringTimer.once(15 * 60, stop_zone2); // Stop zone 2 in 15 minutes
+  stopWateringTimer.once(10 * 60, stop_zone2); // Stop zone 2 in 15 minutes
 }
 
 void stop_zone2() {
